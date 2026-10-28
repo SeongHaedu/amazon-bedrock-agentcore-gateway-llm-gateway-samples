@@ -1,0 +1,22 @@
+{
+  "gatewayIdentifier": "<gateway-id>",
+  "rateLimitId": "UserCHighModel",
+  "dimensionKeys": [
+    "qualifiedModelId",
+    "$.context.jwt.sub"
+  ],
+  "entries": [
+    {
+      "dimensions": {
+        "qualifiedModelId": "<qualified-high-model-id>",
+        "$.context.jwt.sub": "<USER_C_SUB>"
+      },
+      "requests": [
+        {
+          "rate": 4,
+          "period": "second"
+        }
+      ]
+    }
+  ]
+}
