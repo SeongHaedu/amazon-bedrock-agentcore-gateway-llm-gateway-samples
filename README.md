@@ -1,6 +1,9 @@
-English | [日本語](README_JA.md)
+English | [Japanese](README_JA.md)
 
-# AgentCore Gateway: Model Access, Usage, and Budgets
+# Amazon Bedrock AgentCore Gateway: Model Access, Usage, and Budgets
+
+> [!NOTE]
+> This repository is not provided by AWS. It is a sample based on verification in one personal environment. My opinions are my own.
 
 Run a small AI coworker on Amazon Bedrock AgentCore Runtime V2 and manage its model calls through AgentCore Gateway. Cognito authenticates the user, AgentCore Policy authorizes models, rate limits control traffic, and REQUEST / RESPONSE interceptors check budgets and record model costs.
 
@@ -8,7 +11,7 @@ This personal implementation extends an [AWS usage-interceptor sample](https://g
 
 ## Overview and architecture
 
-![Runtime, Gateway, authentication, authorization, traffic controls, and usage accounting (Japanese)](images/ja/01a-aws-architecture.png)
+![AgentCore Gateway architecture with Runtime V2, authentication, authorization, traffic controls, and usage accounting](images/en/01a-aws-architecture.png)
 
 The request path is `User → Runtime V2 → Gateway → Amazon Bedrock`. The agent records in-memory work items and returns a written deliverable. Its tools do not execute the work described in those notes.
 
@@ -87,7 +90,16 @@ fi
 python runtime_v2/manage.py status
 ```
 
-The wrapper deploys the pinned upstream stack, adds the `bedrock-models` inference provider, configures users, Policy and rate limits, and deploys Runtime V2. Both models use the regional Bedrock Runtime endpoint; deployment resolves and checks the selected inference profiles. No direct OpenAI or Anthropic contract is required.
+This `deploy` command also deploys the AWS public sample. Its pinned [CloudFormation template](runtime_v2/vendor/usage-interceptor/standalone.yaml) is included in this repository, so you do not need to clone or deploy the upstream sample separately.
+
+| Order | Resources configured automatically |
+|---|---|
+| Deploy the AWS public sample | Cognito, AgentCore Gateway, REQUEST / RESPONSE Lambda functions and their attachment, DynamoDB, daily/monthly spend rollover, and supporting IAM/KMS resources |
+| Add this repository's components | The `bedrock-models` inference provider, demo users and JWT validation rules, AgentCore Policy, rate limits, and Runtime V2 hosting the AI coworker |
+
+The command waits for the upstream stack to reach `CREATE_COMPLETE` before adding the remaining components. [manage.py](runtime_v2/manage.py) creates those additions through Boto3; not all resources belong to one CloudFormation stack. It reports `deployment_complete` after confirming Runtime is `READY`.
+
+Both models use the regional Bedrock Runtime endpoint; deployment resolves and checks the selected inference profiles. No direct OpenAI or Anthropic contract is required.
 
 Readiness can take several minutes. Check Runtime/Gateway `READY`, platform `V2`, Policy `ENFORCE`, and both interceptor points. `status` also reports `runtime_version`, `rate_status`, `rate_entries`, and `verification_recovery_pending`. Deployment exports `client.json` beside state. Keep state and credentials after a failure; see [resume and recovery](runtime_v2/OPERATIONS.md#resume-and-recovery).
 

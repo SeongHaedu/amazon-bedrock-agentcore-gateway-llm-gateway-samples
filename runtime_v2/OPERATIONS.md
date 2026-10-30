@@ -94,7 +94,7 @@ Other model/tool validation stops are defined in [agent.py](agent.py). Neither c
 
 ## Authentication and model routing
 
-![Inbound authentication, model authorization, and interceptor responsibilities (Japanese)](../images/ja/01b-auth-controls.png)
+![Inbound authentication, model authorization, and interceptor responsibilities](../images/en/01b-auth-controls.png)
 
 Both Runtime and Gateway accept the configured Cognito clients and require `llm-gateway-access`. Runtime's header allowlist exposes `Authorization` to the container; the agent explicitly copies it into each Gateway request. Gateway authorizes the user's JWT and signs the Bedrock request with its own execution role.
 
@@ -122,7 +122,7 @@ The second command writes caps using the operator's AWS permissions; it does not
 
 Spending uses DynamoDB `pk=USER#<sub>`. A new user may have no row yet. REQUEST caches the complete user state for 60 seconds, so updated caps or spending may not affect every Lambda execution environment immediately.
 
-![REQUEST budget check, RESPONSE accounting, DynamoDB, and CloudWatch (Japanese)](../images/ja/04-usage-cost.png)
+![REQUEST budget check, RESPONSE accounting, DynamoDB, and CloudWatch](../images/en/04-usage-cost.png)
 
 | Constraint | Consequence |
 |---|---|
