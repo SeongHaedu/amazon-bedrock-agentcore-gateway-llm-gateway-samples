@@ -9,6 +9,8 @@ Amazon Bedrock AgentCore Runtime V2 に簡易な AI 社員を配置し、AgentCo
 
 この個人の実装サンプルは、[AWS の usage-interceptor サンプル](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor) のテンプレートと Lambda コードを変更せずに拡張したものです。本手順では `runtime_v2/` だけを使います。ルートのモジュールと `scripts/` は、構築手順と状態が異なる旧プロトタイプです。
 
+解説記事: https://zenn.dev/aws_japan/articles/agentcore-llm-gateway
+
 ## 概要と構成図
 
 ![Runtime、Gateway、認証・認可、利用量の制限、費用計上の構成](images/ja/01a-aws-architecture.png)

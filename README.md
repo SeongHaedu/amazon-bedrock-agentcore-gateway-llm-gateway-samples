@@ -9,6 +9,8 @@ Run a small AI coworker on Amazon Bedrock AgentCore Runtime V2 and manage its mo
 
 This personal implementation extends an [AWS usage-interceptor sample](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor) while keeping its template and Lambda code unchanged. Use only `runtime_v2/` for this walkthrough; root modules and `scripts/` are legacy prototypes with separate setup and state.
 
+Blog post (Japanese): https://zenn.dev/aws_japan/articles/agentcore-llm-gateway
+
 ## Overview and architecture
 
 ![AgentCore Gateway architecture with Runtime V2, authentication, authorization, traffic controls, and usage accounting](images/en/01a-aws-architecture.png)
