@@ -1,405 +1,178 @@
 English | [日本語](README_JA.md)
 
-# Amazon Bedrock AgentCore Gateway: LLM Gateway Samples
+# AgentCore Gateway: Model Access, Usage, and Budgets
 
-> [!NOTE]
-> This is a sample for experimentation in a personal AWS environment. It is not an official AWS offering. AWS verification status is listed below.
+Run a small AI coworker on Amazon Bedrock AgentCore Runtime V2 and manage its model calls through AgentCore Gateway. Cognito authenticates the user, AgentCore Policy authorizes models, rate limits control traffic, and REQUEST / RESPONSE interceptors check budgets and record model costs.
 
-Use one Amazon Bedrock AgentCore Gateway to authenticate three users, control which models they can call, and apply a dedicated rate limit to one user/model pair. The application streams native model events and makes one request to the standard model when the identified high-performance limit refuses a request.
+This personal implementation extends an [AWS usage-interceptor sample](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor) while keeping its template and Lambda code unchanged. Use only `runtime_v2/` for this walkthrough; root modules and `scripts/` are legacy prototypes with separate setup and state.
 
-## Scenario
+## Overview and architecture
 
-| User | Standard: Claude Haiku 5.5 | High-performance: Claude Opus 5.5 |
-|---|---|---|
-| A | Allowed, normal limits | Allowed, normal limits |
-| B | Allowed, normal limits | Denied by model authorization |
-| C | Allowed, normal limits | Allowed, lower dedicated rate limit |
+![Runtime, Gateway, authentication, authorization, traffic controls, and usage accounting (Japanese)](images/ja/01a-aws-architecture.png)
 
-All three users authenticate through the same Cognito user pool. C can select the standard model directly. When C selects the high-performance model and receives its verified dedicated-limit HTTP 429, the application calls the standard model once. B's authorization failure does not trigger this behavior.
+The request path is `User → Runtime V2 → Gateway → Amazon Bedrock`. The agent records in-memory work items and returns a written deliverable. Its tools do not execute the work described in those notes.
 
-These are model roles for the example. Choose inference profiles available to your account and Region; neither model identifier has a default. “Normal limits” includes applicable shared limits and service quotas.
-
-## Architecture
-
-![Shared model governance through AgentCore Gateway (Japanese)](images/ja/01-governance.png)
-
-![Inbound authentication, Policy, and interceptors (Japanese)](images/ja/01b-auth-controls.png)
-
-The figures describe design responsibilities, not the service's evaluation order. Both README versions use the Japanese figures.
-
-| Responsibility | Sample component |
+| Control | Implementation |
 |---|---|
-| Identify the caller | Cognito access token and Gateway JWT inbound authorizer |
-| Admit the three principals | AgentCore Policy in `ENFORCE` mode |
-| Authorize the requested model | REQUEST interceptor checks the validated JWT subject and exact URI model ID |
-| Limit C's high-performance traffic | Dedicated Gateway rate limit using user and model dimensions |
-| Call Amazon Bedrock | `bedrock-runtime` inference connector and a dedicated Gateway IAM role |
-| Continue after the dedicated refusal | Application-side, one-request fallback |
-| Optional daily/monthly budget | Budget check after model authorization in REQUEST; RESPONSE accounting and a usage ledger |
+| Authentication | Runtime and Gateway validate Cognito JWTs and require the `llm-gateway-access` group. |
+| Model authorization | Policy in `ENFORCE` mode matches the JWT subject, Gateway, API action, and exact model ID. |
+| Traffic limits | Gateway applies RPM and concurrent-request limits per JWT `sub`, shared across both model aliases. |
+| Budget check | REQUEST Lambda compares recorded spending with each user's daily and monthly caps. |
+| Usage accounting | RESPONSE Lambda converts response usage to cost, updates DynamoDB, and emits CloudWatch metrics. |
 
-The client uses [native InvokeModelWithResponseStream](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-inference-invokemodel.html):
+Runtime allowlists `Authorization`; [agent.py](runtime_v2/agent.py) explicitly forwards the received value to Gateway on every model call. This JWT pass-through is implemented in code. Gateway uses its IAM role to call Bedrock. The Runtime role has no direct Bedrock or budget-table access.
 
-```text
-POST /inference/model/{URL-encoded-model-id}/invoke-with-response-stream
-```
-
-`examples/request.json` contains an [Anthropic Messages body](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html): `anthropic_version`, `max_tokens`, and `messages`. The URI selects the model and streaming operation. There is no body-level `model` or `stream` field.
-
-[Gateway rate limits run before Gateway rules](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-enforcement.html). A request refused there never reaches the Gateway's fallback rules. The application therefore recognizes the dedicated refusal and sends a new request to the same Gateway, with the same JWT and serialized body. Only the URI's model identifier changes. [Gateway fallback rules](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rules-fallback.html) separately handle configured destination failures.
-
-## Structure
-
-```text
-.
-├── scripts/
-│   ├── common.py              AWS configuration, resource ledger, test-user authentication
-│   ├── setup.py               Cognito users, Gateway role, JWT Gateway, inference connector
-│   ├── check_sdk_version.py   Local SDK capability check
-│   ├── configure_access.py    Principal Policy and URI-based model authorization
-│   ├── native_access.py       Deploy the access-check REQUEST Lambda
-│   ├── configure_limits.py    Dedicated C/high-model rate limit
-│   ├── invoke_user.py         Authenticate and invoke as A/B/C
-│   ├── verify_controls.py     Access matrix and isolated fallback checks
-│   ├── configure_budget.py    Optional budget deployment
-│   ├── verify_budget.py       Native accounting, budget refusals, and cap restoration
-│   └── cleanup.py             Inspect/delete only this run's recorded resources
-├── gateway_fallback.py        HTTP client, exact-key fallback, incremental EventStream decoding
-├── invoke.py                  Low-level streaming CLI for an existing Gateway and JWT
-├── access_interceptor.py      Exact subject/model authorization; optional budget composition
-├── budget_interceptors.py     Native request budget check and response usage accounting
-├── examples/
-│   ├── request.json           Native Anthropic request
-│   ├── offline_demo.py        Six scenarios using synthetic responses
-│   ├── rate-limit.example.json
-│   ├── limit-keys.example.json
-│   └── prices.example.json    Price-file format; synthetic prices only
-├── tests/                    Local tests using fixtures
-├── images/ja/                Japanese diagrams
-├── requirements.txt          Python dependencies
-└── results/                  Resource ledger and private run output (gitignored)
-```
+Rate limits are an optional architectural control; this walkthrough configures them. Budgets use post-usage accounting: concurrent requests, the final call, or delayed state can exceed a cap. USD 10 is not a guaranteed ceiling on the AWS bill.
 
 ## Prerequisites
 
-- Python 3.11 or later. `requirements.txt` pins Boto3 and Botocore to `1.43.111`.
-- AWS CLI and a configured AWS profile. Complete the profile's normal sign-in before running the scripts.
-- A Region supporting the features used here and two active, accessible Bedrock inference profiles. Both models must accept the native request body and its features.
-- Permissions to create and remove this sample's Cognito, IAM, Gateway, Policy, rate-limit, Lambda, and CloudWatch Logs resources, including passing its execution roles. Optional budgets also use DynamoDB.
+- Python 3.11, AWS CLI, and a signed-in AWS profile.
+- A Region supporting [Runtime V2](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-how-it-works.html#runtime-platform-versions-regions), the required Gateway features, and the selected inference profiles through the [Messages](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-messages-api.html) / [Responses](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-responses-api.html) APIs.
+- Operator permissions for CloudFormation, S3, Cognito, IAM and role passing, AgentCore Runtime/Gateway/Policy/rate limits, Lambda, DynamoDB, KMS, CloudWatch, and the upstream rollover resources.
+- Connectivity to AWS APIs and public PyPI. Resource creation and model calls incur charges.
 
-AWS setup and invocation create resources and can incur charges. The offline demo uses no AWS resources.
+Deployment uses a Python 3.11 Linux ARM64 ZIP in S3. Docker and a local application backend are unnecessary.
 
-## Setup
+## Environment and configuration
+
+Run commands from the repository root. Replace the profile and Region placeholders. For an existing deployment, select its saved state path instead of the new-deployment example below.
 
 ```bash
-git clone https://github.com/SeongHaedu/amazon-bedrock-agentcore-gateway-llm-gateway-samples.git
-cd amazon-bedrock-agentcore-gateway-llm-gateway-samples
-
-python3 -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install -r runtime_v2/requirements.txt
+
+export AWS_PROFILE="<profile>"
+export AWS_REGION="<supported-region>"
+export RUNTIME_V2_STATE="$PWD/results/runtime-v2/state.json"
+aws sts get-caller-identity
 ```
 
-Run the remaining commands from the repository root.
+Keep command output private. The wrapper discovers the account and checks subsequent operations against the state file's account and Region. `RUNTIME_V2_STATE` selects the deployment for all operator commands.
 
-### Select the AWS environment
-
-Replace the profile placeholder. Set `AWS_REGION` yourself to override the profile's Region; otherwise the command below reads it from that profile. It stops with an instruction if neither is set.
+For a new deployment, prepare a local configuration without overwriting an existing copy:
 
 ```bash
-export AWS_PROFILE='<your-profile>'
-export AWS_REGION="${AWS_REGION:-$(aws configure get region --profile "$AWS_PROFILE")}"
-: "${AWS_REGION:?Set AWS_REGION to a Region supported by your selected features and models}"
+mkdir -p local
+if [ ! -e local/runtime-v2-config.json ]; then
+  cp runtime_v2/config.example.json local/runtime-v2-config.json
+fi
 ```
 
-The Python scripts call STS `GetCallerIdentity` and derive the account and partition from its response. Gateway endpoints, resource IDs, and ARNs come from AWS responses and the local ledger. No account ID, endpoint, or ARN needs to be copied into this README or source code.
+Review that file before deployment. For an existing deployment, skip configuration creation and deployment, and go to [Keep and reuse the environment](#keep-and-reuse-the-environment).
 
-### Select the two inference profiles
-
-```bash
-aws bedrock list-inference-profiles \
-  --region "$AWS_REGION" \
-  --query 'inferenceProfileSummaries[].[inferenceProfileId,inferenceProfileName,status]' \
-  --output json
-
-export PRIMARY_MODEL_ID='<high-performance-inference-profile-id-or-arn>'
-export FALLBACK_MODEL_ID='<standard-inference-profile-id-or-arn>'
-```
-
-Use the high-performance profile for `PRIMARY_MODEL_ID` (`--model high`) and the standard profile for `FALLBACK_MODEL_ID` (`--model standard`). Select two distinct profiles valid in your environment. Do not assume a geographic prefix works in another Region.
-
-`setup.py` resolves each value with `GetInferenceProfile`, requires `ACTIVE`, and grants model-invocation permissions only for the returned profile and model ARNs. Model-listing actions use a separate statement with `Resource: "*"`. A successful profile lookup alone does not prove that model invocation is authorized.
-
-### Keep the run's resource ledger
-
-The default ledger is `results/resources.json`. To use a separate ledger, set this before setup and keep it set for every later command:
-
-```bash
-export GATEWAY_STATE_FILE='results/my-run/resources.json'
-```
-
-Setup refuses to overwrite an existing ledger. Later scripts verify that the selected account, partition, and Region match it. Keep the ledger after a failed setup so cleanup can inspect recorded resources and unresolved creation attempts. Shared SDK clients disable automatic retries; their maximum total attempts is one.
-
-## Step 0: Check the SDK
-
-```bash
-python scripts/check_sdk_version.py
-```
-
-Reads the installed Botocore service model without credentials or AWS calls. It checks the Gateway authorizer, Policy, interceptor, inference-target, and rate-limit definitions required by these scripts. An empty `missing_capabilities` list and exit status `0` indicate success. SDK shape availability is separate from regional service availability and AWS authorization.
-
-## Step 1: Create the Gateway and test users
-
-```bash
-python scripts/setup.py
-```
-
-Creates an isolated run containing a Cognito user pool, an application client, three test users, a dedicated IAM role and inline policy, a JWT-authenticated Gateway, and a `bedrock-runtime` inference connector target. User creation suppresses invitation messages.
-
-The JWT authorizer accepts the sample application's client ID. The role's trust is narrowed to the newly created Gateway, and setup polls until the Gateway and target are `READY`. The ledger records their identities.
-
-Setup establishes authentication and the inference connection. Complete and verify model authorization before making the Gateway available to other callers.
-
-## Step 2: Configure model authorization
-
-```bash
-python scripts/configure_access.py
-python scripts/verify_controls.py
-```
-
-The configuration uses two controls. An enforcing Policy Engine admits the three recorded principals. A REQUEST Lambda then authorizes the model using the Gateway-validated JWT `sub` and the exact model ID decoded from the native URI: A/C may use both models, and B may use only standard. The deployment generates the allowlist and expected Gateway identity from this run's ledger.
-
-In the native Policy probe, `context.input` existed but `context.input has model` was false. A caller-supplied body `model` is not bound to the model actually selected by the URI. The [Chat Completions policy example](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html) therefore does not establish native model authorization. This sample enforces model access in `access_interceptor.py`; it does not claim that Policy alone enforces the model matrix.
-
-The interceptor accepts only the supported native POST path, checks the expected Gateway context, and compares exact model identifiers. It relies on Gateway JWT validation rather than validating a JWT signature itself. Deployment restricts Lambda invocation to the Gateway and passes request headers to it.
-
-Run the access verifier before creating a rate limit. It sends seven inference-endpoint requests: one invalid-token request expecting HTTP 401, then all six user/model pairs. B/high must return HTTP 403; the other five must return HTTP 200 and a complete stream. Success records `verification.access = "passed"` in the ledger. The report is `verify-access.json` beside that ledger, and a failed check exits nonzero. The next step requires this success record.
-
-## Step 3: Configure C's dedicated rate limit
-
-Choose a positive requests-per-minute value. The following example uses 240; the CLI has no default.
-
-```bash
-export PREMIUM_RPM='240'
-python scripts/configure_limits.py --premium-rpm "$PREMIUM_RPM"
-```
-
-Creates or updates one limit combining C's JWT subject and the selected high-performance model, with `period: "minute"`. It waits 31 seconds for propagation and clears any previously verified fallback keys. The CLI accepts finite positive numbers; zero is reserved for the isolated test in Step 5.
-
-[Rate-limit dimensions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-dimensions.html) include `$.context.jwt.sub` and `qualifiedModelId`. Step 5 checks the actual refusal's complete key against this exact configuration. `examples/rate-limit.example.json` illustrates the SDK input shape; it is not applied by this command.
-
-New or idle limits [can initially admit more than their nominal rate](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-enforcement.html). Setting one request per minute does not establish a strict one-request-per-60-second boundary. A fixed request number is not a reliable throttle test.
-
-## Step 4: Invoke as each user
-
-```bash
-python scripts/invoke_user.py --user a --model standard
-python scripts/invoke_user.py --user a --model high
-python scripts/invoke_user.py --user b --model standard
-python scripts/invoke_user.py --user b --model high
-python scripts/invoke_user.py --user c --model standard
-python scripts/invoke_user.py --user c --model high
-```
-
-The wrapper obtains a token for the chosen test user and invokes the Gateway using the saved resource identities. The shared authentication helper generates a fresh password for that test user and obtains an access token with Cognito administrative authentication. The token stays in memory.
-
-B's high-performance invocation should fail authorization. C's high-performance invocation should stream normally below the dedicated limit. The six commands above leave fallback disabled to expose the first request's result.
-
-The wrapper prints an initial user/status/attempt summary followed by native event JSON. It exits `0` after a complete stream and nonzero on a refusal or failure. `--prompt` changes the prompt and `--max-tokens` sets a value from 1 to 4096; its default is 24. Step 5 verifies and enables the fallback path.
-
-The existing `invoke.py` emits JSON Lines, flushing each native model event as it arrives:
-
-| Event | Meaning |
+| Configuration | Supplied value |
 |---|---|
-| `gateway_response` | Requested/attempted models, final HTTP status, fallback decision |
-| `model_event` | Native Anthropic event, retaining text, thinking, and usage structure |
-| `complete` | Stream completed; includes the model reported by `message_start`, if present |
-| `http_error` / `client_error` | Final HTTP refusal or input/transport/stream failure |
+| `models.standard` | `global.anthropic.claude-haiku-5-5`, Messages |
+| `models.premium` | `global.openai.gpt-6-sol`, Responses |
+| `daily_budget_usd` / `monthly_budget_usd` | USD `10` each, per user; reaching either cap stops new calls |
+| `rpm` / `concurrency` | `60` requests/minute and `2` concurrent requests per JWT `sub` |
+| `max_model_calls` / `max_output_tokens` | `4` attempts per task / `1024` output tokens per model call |
+| `max_input_chars` | `12000` characters per task |
 
-Its exit status is `0` for a completed stream, `1` for a final non-200 HTTP response, and `2` for input, transport, or stream errors. Partial output can precede failure.
+`price_table` uses USD per 1,000 tokens and requires `in`, `out`, `cache_read`, `cache_write_5m`, and `cache_write_1h`. Check [current Bedrock prices](https://aws.amazon.com/bedrock/pricing/), model availability, and requested/returned model IDs; example rates are not a current price quote. [Accounting details](runtime_v2/OPERATIONS.md#budgets-and-accounting) explain response-model aliases and cache limitations.
 
-For an existing Gateway, `invoke.py` reads `GATEWAY_ENDPOINT`, both model variables, and an optional `FALLBACK_LIMIT_KEYS_FILE`. It prompts for the JWT without echoing it unless `GATEWAY_BEARER_TOKEN` is set. Without a verified complete-key allowlist, fallback is disabled. `.env.example` is a reference and is not loaded automatically.
+Models, endpoints, and limits are server configuration. Invocation input accepts only `task` and the `standard` / `premium` alias. Configuration changes require a separate deployment and state; per-user budget overrides have their own command.
 
-## Step 5: Verify the controls on AWS
+## Deploy and check status
 
-```bash
-python scripts/verify_controls.py --limits
-```
-
-Run this after Step 2 succeeds for invalid-token rejection and all six user/model pairs. This command verifies isolation and fallback by temporarily changing only C's dedicated high-performance rate to zero. It first checks that the saved positive rate matches the actual dedicated configuration.
-
-| Check while the dedicated rate is zero | Expected behavior |
-|---|---|
-| C/high | HTTP 429 with the complete key for this exact user/model limit |
-| C/standard | HTTP 200 and a complete stream |
-| A/high | HTTP 200 and a complete stream |
-| B/high | HTTP 403 |
-| C/high with application fallback | HTTP 200, one standard-model fallback, exactly two attempts, and a complete stream |
-
-The verifier waits 31 seconds after setting zero and restores the original positive rate in `finally`, followed by another 31-second propagation wait. This is an isolation and switching test, not a sustained-load accuracy test at a positive rate. It makes five probes, totaling six inference-endpoint requests because fallback uses two requests.
-
-In the native response, `limitKey` is the rate identifier alone. The verifier first checks that this rate has exactly the dedicated C/model entry, checks the refusal and isolation controls, and registers the exact returned key in `verified_fallback_limit_keys`. Do not reuse that rate identifier for shared limits; reverify after changing its scope. No manual key copying is needed. The report is `verify-limits.json` beside the ledger. A failed check clears the fallback keys.
-
-After verification succeeds, enable fallback for an interactive invocation:
+For a new deployment, choose a state path that does not already exist:
 
 ```bash
-python scripts/invoke_user.py --user c --model high --fallback
+if [ ! -e "$RUNTIME_V2_STATE" ]; then
+  python runtime_v2/manage.py deploy --config local/runtime-v2-config.json
+else
+  echo "State already exists; follow the reuse or recovery instructions."
+fi
+python runtime_v2/manage.py status
 ```
 
-The restored positive rate applies to this request, so it switches only if that dedicated limit actually refuses it. `--fallback` without a matching verified key never switches models.
+The wrapper deploys the pinned upstream stack, adds the `bedrock-models` inference provider, configures users, Policy and rate limits, and deploys Runtime V2. Both models use the regional Bedrock Runtime endpoint; deployment resolves and checks the selected inference profiles. No direct OpenAI or Anthropic contract is required.
 
-If interruption or restoration failure leaves `rate_restore_required` in the ledger set to `true`, restore the original positive rate before continuing, or clean up the run:
+Readiness can take several minutes. Check Runtime/Gateway `READY`, platform `V2`, Policy `ENFORCE`, and both interceptor points. `status` also reports `runtime_version`, `rate_status`, `rate_entries`, and `verification_recovery_pending`. Deployment exports `client.json` beside state. Keep state and credentials after a failure; see [resume and recovery](runtime_v2/OPERATIONS.md#resume-and-recovery).
+
+## Invoke: success and Policy denial
 
 ```bash
-python scripts/configure_limits.py --premium-rpm "$PREMIUM_RPM"
+python runtime_v2/manage.py invoke --user employee --model standard \
+  --task "Plan a one-day onboarding session. Record two work items with record_work_item, inspect them with list_work_items, and return a short plan. Do not claim to have performed the work."
+
+python runtime_v2/manage.py invoke --user employee --model premium \
+  --task "Plan a one-day onboarding session. Record two work items with record_work_item, inspect them with list_work_items, and return a short plan. Do not claim to have performed the work."
 ```
 
-Use the original value selected in Step 3. Reconfiguration clears verified keys, so run `verify_controls.py --limits` again before using fallback. Keep ledgers and reports in the ignored `results/` directory; they can contain environment identifiers.
+The helper signs in using the private demonstration-user credentials. Runtime returns one synchronous JSON result after the model/tool loop finishes (`stream: false`). Inspect `result.status`, `answer`, `work_items`, and `model_calls`; model output is nondeterministic.
 
-## Step 6 (optional): Add daily and monthly budgets
+| User | `standard` | `premium` |
+|---|---|---|
+| `employee` | Allowed | Allowed |
+| `restricted` | Allowed | Denied by Policy |
+| `outsider` | Rejected: no access-group membership | Rejected: no access-group membership |
 
-![Response-time accounting and concurrent budget overshoot (Japanese)](images/ja/05-budget-timeline.png)
-
-Rate limits count short-term traffic. Monetary budgets require usage, prices, and accumulated spending. The optional design checks a user's existing daily/monthly total in REQUEST and adds priced usage after the model response in RESPONSE.
-
-The [original public budget sample at the referenced revision](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor/tree/d79bd57f6d5461b81f862630961b72c49967a4f9) cannot be used unchanged for this native URI/EventStream path. Six local compatibility cases confirmed that limitation. This repository provides a separate native adapter.
-
-Create `local/prices.json` by entering the actual applicable prices for both selected models. The command reads model IDs from the ledger and asks for all five per-million-token USD rates: input, output, cache read, five-minute cache write, and one-hour cache write. It refuses to overwrite an existing file.
+Compare authorization for the same user:
 
 ```bash
-python -c '
-import json
-import os
-from decimal import Decimal, InvalidOperation
-from pathlib import Path
-
-path = Path("local/prices.json")
-if path.exists():
-    raise SystemExit("local/prices.json already exists; review and edit it explicitly.")
-state_path = Path(os.environ.get("GATEWAY_STATE_FILE") or "results/resources.json")
-state = json.loads(state_path.read_text())
-fields = (
-    "input_per_million_usd",
-    "output_per_million_usd",
-    "cache_read_per_million_usd",
-    "cache_write_5m_per_million_usd",
-    "cache_write_1h_per_million_usd",
-)
-prices = {}
-for label in ("standard", "premium"):
-    model_id = state["models"][label]["id"]
-    rates = {}
-    print(f"Enter applicable prices for {label}: {model_id}")
-    for field in fields:
-        raw = input(f"{field} (USD per million tokens): ").strip()
-        try:
-            value = Decimal(raw)
-        except InvalidOperation:
-            raise SystemExit(f"Invalid decimal for {field}")
-        if (not value.is_finite() or value < 0 or value > Decimal("1e12")
-                or value.as_tuple().exponent < -12):
-            raise SystemExit("Use a finite nonnegative rate with at most 12 decimal places.")
-        rates[field] = str(value)
-    prices[model_id] = rates
-path.parent.mkdir(parents=True, exist_ok=True)
-with path.open("x", encoding="utf-8") as output:
-    json.dump(prices, output, indent=2)
-    output.write("\n")
-path.chmod(0o600)
-print("Created local/prices.json")
-'
+python runtime_v2/manage.py invoke --user restricted --model standard \
+  --task "Describe your note-taking tools in one sentence."
+python runtime_v2/manage.py invoke --user restricted --model premium \
+  --task "Describe your note-taking tools in one sentence."
 ```
 
-`examples/prices.example.json` contains synthetic fixture rates, not actual prices. Do not copy them as billing rates or use zero to represent an unknown price. The adapter requires all five finite, nonnegative rates, including unused categories.
+The premium request should return `result.status="stopped"`, `stop_reason="POLICY_DENIED"`, and `gateway_status=403`. Handled stops also use outer HTTP `200`; HTTP success alone is not task success. The CLI exits `0` only for `completed`, and `2` for a stopped/failed invocation. The agent does not retry or switch models. See [response handling](runtime_v2/OPERATIONS.md#responses-and-stops) and the [end-user client](runtime_v2/OPERATIONS.md#end-user-client).
+
+## Run end-to-end verification
 
 ```bash
-export DAILY_BUDGET_USD='<daily-decimal-usd>'
-export MONTHLY_BUDGET_USD='<monthly-decimal-usd>'
-python scripts/configure_budget.py \
-  --prices local/prices.json \
-  --daily "$DAILY_BUDGET_USD" \
-  --monthly "$MONTHLY_BUDGET_USD"
+python runtime_v2/verify.py
 ```
 
-The deployment keeps the existing `access-request` Lambda as the REQUEST interceptor. Its handler authorizes the exact user/model first, then calls the budget REQUEST handler when `ENABLE_BUDGET=true`. It preserves `MODEL_ACCESS_JSON` and `EXPECTED_GATEWAY_ARN`, and adds a budget RESPONSE Lambda and DynamoDB accounting. Enabling budgets does not replace model authorization.
+This runs billable AWS checks and writes private `verification.json` beside the state. It checks configuration, JWT/group rejection, both model/tool loops, spending and CloudWatch usage, model authorization, rate rejection, and budget rejection.
 
-Add `--observe` to the deployment command to record priced usage without refusing requests solely for exceeding a budget cap. Model authorization and invalid configuration, identity, price, or storage checks still apply. The default enforces the caps.
+Verification temporarily adds probe-specific rate entries, then restores the original entries. It sets a dedicated probe's recorded spending and caps to USD 10; it does not spend USD 10 to test the budget or alter the employee's caps. Probe users are disabled afterward. If a recovery file remains, verification stops; use `python runtime_v2/manage.py restore-verification --yes` as described in [recovery](runtime_v2/OPERATIONS.md#resume-and-recovery).
 
-Choose this mode before the first budget deployment. The script refuses another attempt when a budget attempt is already recorded; it does not automatically resume or roll back a partial activation. Keep the ledger and inspect its recorded stage and mutations if deployment fails, or clean up the run. Run Gateway configuration commands sequentially.
+The verifier archives prior reports under `verification-history/` and records terminal status (`PASSED`, `FAILED`, or `INTERRUPTED`) with timestamps. A new AWS E2E run has not been performed for the latest management and verification changes. Earlier results in [VERIFICATION.md](runtime_v2/VERIFICATION.md) do not certify them. See [verification details](runtime_v2/OPERATIONS.md#verification-and-manual-checks).
 
-The Lambda ZIP contains the access and budget modules. Its Python 3.12 runtime supplies Boto3/Botocore; the local versions pinned in `requirements.txt` apply to the deployment environment.
+## Keep and reuse the environment
 
-[HTTP/inference RESPONSE interceptors buffer the entire response](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html#gateway-interceptors-types-http). Adding this step changes the streaming experience: the client may still parse events, but the Gateway waits for the complete response before the interceptor processes it. Do not use the base client's incremental decoding as evidence of live token delivery with this option enabled.
+Keep the deployed resources for further use; cleanup is a separate, optional action. Preserve the entire private state directory, including the state JSON, `<state-stem>-credentials.json`, and recovery evidence. Running `deploy` with a new state path creates a separate deployment.
 
-The adapter associates requests with the Gateway and JWT subject, fixes the admission day's UTC date/month and price table, and records daily/monthly model-cost estimates. RESPONSE supports complete native Anthropic Messages EventStream usage. Missing, incomplete, or unsupported usage is unaccounted usage, not zero cost; a response-accounting failure leaves the model response unchanged and reports an unrecorded accounting status.
-
-The timeline illustrates response-time accounting, not a reserved-spend mechanism. Concurrent or already admitted requests can exceed a cap. A budget refusal returns HTTP 403 with `BUDGET_EXCEEDED`; it must not trigger fallback. Model-price estimates are separate from AWS billing and infrastructure charges.
-
-In enforcement mode, verify one native response is charged to both periods, then temporarily set the REQUEST daily cap to zero to verify budget rejection and retained model authorization:
+In a later shell, activate the Python environment and select the original AWS environment and saved state:
 
 ```bash
-python scripts/verify_budget.py
+source .venv/bin/activate
+export AWS_PROFILE="<original-profile>"
+export AWS_REGION="<original-region>"
+export RUNTIME_V2_STATE="<absolute-path-to-existing-state.json>"
+python runtime_v2/manage.py status
+python runtime_v2/manage.py budget --user employee
+python runtime_v2/manage.py invoke --user employee --model standard \
+  --task "Record two preparation tasks for a team meeting and give a short agenda."
 ```
 
-Use positive original caps and sufficient remaining budget for A's initial standard-model request. The test makes four requests: one successful A/standard call, then A/standard and C/high budget refusals and a B/high model-authorization refusal. No refusal may trigger fallback. The original REQUEST environment is restored in `finally`; the report is `verify-budget.json` beside the ledger. This checks post-response accounting and a zero-cap refusal, not exact spending limits under concurrency. If interrupted with `budget_restore_variables` still in the ledger, retain the file and clean up the run before starting over.
-
-## Step 7: Clean up
-
-Use the same AWS profile, Region, and `GATEWAY_STATE_FILE` as setup.
+Routine invocations do not require another `deploy`. When resuming deployment or deploying code changes, export the saved configuration and use the same state:
 
 ```bash
-python scripts/cleanup.py
-python scripts/cleanup.py --yes
+python runtime_v2/manage.py export-config --output local/runtime-v2-saved-config.json &&
+python runtime_v2/manage.py deploy --config local/runtime-v2-saved-config.json &&
+python runtime_v2/manage.py status
 ```
 
-The first command reads the ledger and lists deletion candidates without deleting them. The second deletes resources recorded for this run. Cleanup checks the selected account/partition/Region and validates resource ownership against saved identities where implemented; it does not perform a general account-wide cleanup.
+Export writes only saved configuration and refuses an existing output path; choose a new filename if necessary. Use this configuration for an existing deployment rather than the example defaults. Keep state, credentials, exported configuration, and results private. See [OPERATIONS.md](runtime_v2/OPERATIONS.md) for recovery and client access. Do not run cleanup during normal reuse.
 
-Cleanup retains the ledger and records deletion progress. If it reports remaining resources or unresolved creation attempts, keep the file and inspect the reported items. A failed or interrupted creation can require reconciliation even when no recorded resources remain. For a new run, choose a new state-file path; setup will not overwrite the old one.
+## Optional cleanup
 
-## Verification status
-
-Local client checks can be run without AWS:
+Skip this while retaining the environment. When you explicitly decide to remove it, select its original profile, Region, and state, then run:
 
 ```bash
-python -m unittest discover -s tests -v
-python examples/offline_demo.py
+python runtime_v2/cleanup.py --yes
 ```
 
-The local suite covers client behavior, native access checks, and budget parsing/accounting with fixtures. The offline demo supplies six synthetic A/B/C responses. These checks do not establish AWS JWT enforcement, Policy evaluation, rate-limit accuracy, routing, or budget deployment.
+Cleanup deletes the owned deployment and marks local state as deleted. The upstream template retains the spend table, KMS key, rollover archive bucket, and Lambda versions; CloudWatch logs are not purged. Data and charges can remain. Inspect the private state's `stack_resources` and actual remaining resources; keep the key while encrypted data depends on it. See [retained resources](runtime_v2/OPERATIONS.md#cleanup-and-retained-resources).
 
-AWS verification on 2026-10-28 used native streaming calls to the two scenario models:
+## Scope and sources
 
-| Check | Observed result |
-|---|---|
-| Invalid JWT and six user/model pairs | Invalid JWT: 401; A/C: both models complete; B: standard completes, high returns 403 |
-| Dedicated C/high rate temporarily set to zero | C/high: 429; C/standard and A/high complete; B/high remains 403 |
-| Application fallback for that dedicated refusal | C reaches a complete standard-model response with exactly two attempts |
-| Optional native budget accounting | Equal positive charges in the daily and monthly ledgers after one complete response |
-| REQUEST daily cap temporarily set to zero | A/standard and C/high: BUDGET_EXCEEDED; B/high: MODEL_ACCESS_DENIED; no fallback |
+Work items and history last for one invocation. This implementation has no arbitrary execution tools, progressive streaming, token reservation, automatic model fallback, or human approval workflow. Token-cost counters exclude other AWS service charges and can miss accounting failures; they do not guarantee a strict budget.
 
-Rate and budget settings were restored after their checks. Price inputs were synthetic, so this does not validate billing accuracy. These bounded tests do not measure sustained positive-rate enforcement, production concurrency, or a hard spending cap. Raw ledgers and run reports contain environment identifiers and are deliberately not committed.
-
-All resources recorded for the verification run were cleaned up with `scripts/cleanup.py`.
-
-## Notes and current limits
-
-- Fallback requires an initial high-performance request, HTTP 429, a recognized and unambiguous JSON error, and exact equality with an allowed complete `limitKey`. Unknown/shared limits, authorization failures, malformed errors, network failures, and server errors do not qualify. The second request is not retried.
-- Once HTTP 200 is accepted, there is no retry or model switch, even before the first text event. Broken EventStream frames, disconnects, native error events, or a missing `message_stop` fail the stream.
-- The client incrementally decodes `application/vnd.amazon.eventstream` with Botocore frame/CRC validation. The library's `iter_chunks()` checks the envelope; the CLI additionally checks Anthropic completion events. Use the library result as a context manager to close abandoned streams.
-- Both models must support the same request body and features. Switching model IDs does not convert the payload.
-- The requested model, attempted URI model, and response-reported model are different evidence. Routing rules can rewrite destinations; use responses and routing logs when determining which model served a request.
-- TLS verification stays enabled, redirects are refused, and the HTTP client disables environment proxies.
-- Keep ledgers, exact limit keys, JWTs, prices for private runs, and raw responses in local ignored files. A custom state path outside `results/` needs its own exclusion from version control.
-- Optional response-time budget accounting changes streaming latency and is not a strict spending ceiling. Its native compatibility must be demonstrated on the deployed configuration.
-
-## References
-
-- [Inference targets](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-targets-inference.html) and [inference connectors](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-inference-connector.html)
-- [Native InvokeModel APIs through Gateway](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-inference-invokemodel.html)
-- [JWT inbound authorization](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/inbound-jwt-authorizer.html)
-- [Policy authorization flow](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-authorization-flow.html) and [action/resource policy examples](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/example-policies-action-resource.html)
-- [Rate-limit dimensions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-dimensions.html) and [enforcement](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-enforcement.html)
-- [Gateway model fallback](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rules-fallback.html)
-- [HTTP/inference interceptors and response buffering](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors-types.html#gateway-interceptors-types-http)
-- [Claude Haiku 5.5 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-5-5.html) and [Claude Opus 5.5 model card](https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-opus-5-5.html)
-- [Anthropic Messages parameters](https://docs.aws.amazon.com/bedrock/latest/userguide/model-parameters-anthropic-claude-messages.html)
-- [Gateway observability](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/observability-gateway-metrics.html) and [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/)
+- Implementation: [manage.py](runtime_v2/manage.py), [agent.py](runtime_v2/agent.py), [config.example.json](runtime_v2/config.example.json), and [operations](runtime_v2/OPERATIONS.md).
+- AWS guidance: [inference providers](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-target-inference-provider.html), [Policy](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy.html), [interceptors](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-interceptors.html), and [rate enforcement](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-rate-limits-enforcement.html).
+- Upstream: [pinned template](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor/blob/d79bd57f6d5461b81f862630961b72c49967a4f9/cloudformation/standalone.yaml), [SOURCE.json](runtime_v2/vendor/usage-interceptor/SOURCE.json) with its SHA-256 and `changes: "none"`, and [MIT No Attribution license](runtime_v2/vendor/usage-interceptor/LICENSE). The wrapper has its own [MIT license](LICENSE).

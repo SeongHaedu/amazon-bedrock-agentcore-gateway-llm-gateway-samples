@@ -5,6 +5,7 @@ __pycache__/
 .env.*
 !.env.example
 results/
+build/
 local/
 *.token
 .DS_Store
