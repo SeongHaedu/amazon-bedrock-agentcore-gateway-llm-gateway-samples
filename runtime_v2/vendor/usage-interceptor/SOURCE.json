@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor",
+  "commit": "d79bd57f6d5461b81f862630961b72c49967a4f9",
+  "path": "cloudformation/standalone.yaml",
+  "sha256": "e0a5aedf50de58118bb8344bc93e3ad7a65c8ae5fe4ff90bfd9c113e639a16ec",
+  "changes": "none"
+}
