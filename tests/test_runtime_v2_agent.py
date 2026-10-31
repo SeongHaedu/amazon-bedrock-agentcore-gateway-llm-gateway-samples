@@ -472,6 +472,83 @@ class AgentTests(unittest.TestCase):
                     release.set()
                 self.assertEqual(invocation.result(timeout=3).status_code, 200)
 
+    def test_strands_executes_decorated_tools_without_retries_or_auxiliary_models(self):
+        gateway = GatewayFixture(
+            tool_turn("messages", tool_call("messages")),
+            message(text_block()),
+        )
+        with patch.object(agent, "Agent", wraps=agent.Agent) as factory:
+            result = self.invoke(gateway)
+        self.assertEqual(result.json()["status"], "completed")
+        self.assertEqual(len(result.json()["work_items"]), 1)
+        self.assertEqual(len(gateway.calls), 2)
+        options = factory.call_args.kwargs
+        self.assertIsInstance(options["model"], agent.GatewayModel)
+        self.assertIsNone(options["retry_strategy"])
+        self.assertIsNone(options["callback_handler"])
+        self.assertIs(options["context_manager"], False)
+        self.assertIsInstance(options["tool_executor"], agent.SequentialToolExecutor)
+        self.assertEqual(
+            [tool.tool_spec["name"] for tool in options["tools"]],
+            ["record_work_item", "list_work_items"],
+        )
+        self.assertNotIn(JWT, json.dumps(options["model"].get_config()))
+
+    def test_tool_limit_stops_strands_without_another_model_or_tool_execution(self):
+        for api, alias in (("messages", "standard"), ("responses", "premium")):
+            with self.subTest(api=api), patch.object(agent, "MAX_WORK_ITEMS", 1):
+                gateway = GatewayFixture(tool_turn(
+                    api, tool_call(api, "first"), tool_call(api, "over-limit"),
+                    tool_call(api, "must-not-run"),
+                ))
+                with patch.object(agent, "execute_tool", wraps=agent.execute_tool) as execute:
+                    result = self.invoke(gateway, {"task": TASK, "model": alias})
+                self.assertEqual(result.json()["stop_reason"], "WORK_ITEM_LIMIT")
+                self.assertEqual(len(result.json()["work_items"]), 1)
+                self.assertEqual(execute.call_count, 2)
+                self.assertEqual(len(gateway.calls), 1)
+
+    def test_strands_does_not_truncate_history_with_maximum_configured_turns(self):
+        gateway = GatewayFixture(*[
+            tool_turn("messages", tool_call("messages", f"call-{i}", "list_work_items", {}))
+            for i in range(32)
+        ])
+        result = self.invoke(gateway, config=settings(max_model_calls=32))
+        self.assertEqual(result.json()["stop_reason"], "MAX_MODEL_CALLS")
+        self.assertEqual(result.json()["model_calls"], 32)
+        self.assertEqual(len(gateway.calls[-1]["body"]["messages"]), 63)
+        self.assertEqual(gateway.calls[-1]["body"]["messages"][0]["content"], TASK)
+
+    def test_unexpected_tool_exception_stops_remaining_tools_and_model_calls(self):
+        for api, alias in (("messages", "standard"), ("responses", "premium")):
+            with self.subTest(api=api):
+                gateway = GatewayFixture(tool_turn(
+                    api, tool_call(api, "failed"), tool_call(api, "must-not-run"),
+                ))
+                with patch.object(agent, "execute_tool", side_effect=RuntimeError(AUTH + TASK)) as execute:
+                    result = self.invoke(gateway, {"task": TASK, "model": alias})
+                self.assertEqual(result.json()["stop_reason"], "TOOL_EXECUTION_ERROR")
+                self.assertEqual(result.json()["work_items"], [])
+                self.assertEqual(execute.call_count, 1)
+                self.assertEqual(len(gateway.calls), 1)
+                self.assertNotIn(JWT, result.text)
+                self.assertNotIn(TASK, result.text)
+
+    def test_native_tool_arguments_and_ids_are_validated_before_strands_execution(self):
+        duplicate = tool_call("responses")
+        duplicate["arguments"] = '{"title":"First","title":"Second","detail":"Detail"}'
+        for document, reason in (
+            (response(duplicate), "INVALID_TOOL_ARGUMENTS"),
+            (response(tool_call("responses"), tool_call("responses")), "INVALID_TOOL_CALL"),
+            (response(tool_call("responses", "")), "INVALID_TOOL_CALL"),
+        ):
+            with self.subTest(reason=reason):
+                gateway = GatewayFixture(document)
+                result = self.invoke(gateway, {"task": TASK, "model": "premium"})
+                self.assertEqual(result.json()["stop_reason"], reason)
+                self.assertEqual(result.json()["work_items"], [])
+                self.assertEqual(len(gateway.calls), 1)
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_environment_is_loaded_only_as_server_configuration(self):

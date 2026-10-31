@@ -5,7 +5,7 @@
 > [!NOTE]
 > 本リポジトリは AWS 公式が提供するものではなく、あくまで個人の環境での検証結果に基づいたサンプルです。発言は組織を代表しません。
 
-Amazon Bedrock AgentCore Runtime V2 に簡易な AI 社員を配置し、AgentCore Gateway 経由のモデル呼び出しを管理します。Cognito で利用者を認証し、AgentCore Policy でモデルを認可します。Rate limit で利用ペースを制限し、REQUEST / RESPONSE interceptor で予算を検査してモデル費用を計上します。
+Strands Agents で実装した簡易な AI 社員を Amazon Bedrock AgentCore Runtime V2 に配置し、AgentCore Gateway 経由のモデル呼び出しを管理します。Cognito で利用者を認証し、AgentCore Policy でモデルを認可します。Rate limit で利用ペースを制限し、REQUEST / RESPONSE interceptor で予算を検査してモデル費用を計上します。
 
 この個人の実装サンプルは、[AWS の usage-interceptor サンプル](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor) のテンプレートと Lambda コードを変更せずに拡張したものです。本手順では `runtime_v2/` だけを使います。ルートのモジュールと `scripts/` は、構築手順と状態が異なる旧プロトタイプです。
 
@@ -15,7 +15,9 @@ Amazon Bedrock AgentCore Runtime V2 に簡易な AI 社員を配置し、AgentCo
 
 ![Runtime、Gateway、認証・認可、利用量の制限、費用計上の構成](images/ja/01a-aws-architecture.png)
 
-要求の経路は `利用者 → Runtime V2 → Gateway → Amazon Bedrock` です。エージェントはメモリ内に作業項目を記録し、文章の成果物を返します。メモに書いた作業自体をツールで実行するものではありません。
+要求の経路は `利用者 → Runtime V2 → Gateway → Amazon Bedrock` です。Strands の `Agent` がモデル・ツールループを実行し、`@tool` で登録した `record_work_item` と `list_work_items` を使います。ツールはメモリ内のメモを記録・確認するもので、メモに書いた作業自体は実行しません。エージェントは文章の成果物を返します。
+
+小さなカスタム Strands `Model` アダプターが、既存の Messages / Responses API と `stream: false` を使って Gateway を呼び出します。モデル認可、rate limit、予算・費用計上は、引き続き Gateway と既存の REQUEST / RESPONSE Lambda、DynamoDB が担当します。
 
 | 管理すること | 実装 |
 |---|---|
@@ -115,7 +117,7 @@ python runtime_v2/manage.py invoke --user employee --model premium \
   --task "新人向けの 1 日研修を計画してください。record_work_item で作業項目を 2 件記録し、list_work_items で確認してから短い計画を返してください。作業を実行したとは書かないでください。"
 ```
 
-Helper は非公開のデモ利用者認証情報でサインインします。Runtime はモデル・ツールループ終了後に、同期の JSON 応答を 1 つ返します (`stream: false`)。`result.status`、`answer`、`work_items`、`model_calls` を確認してください。モデルの出力は実行ごとに変わる場合があります。
+Helper は非公開のデモ利用者認証情報でサインインします。Runtime は Strands のモデル・ツールループ終了後に、既存形式の同期 JSON 応答を 1 つ返します。Strands の内部イベントは、利用者への逐次ストリーミングを意味しません。Gateway へのモデル要求は引き続き `stream: false` を使います。`result.status`、`answer`、`work_items`、`model_calls` を確認してください。モデルの出力は実行ごとに変わる場合があります。
 
 | 利用者 | `standard` | `premium` |
 |---|---|---|
@@ -144,7 +146,7 @@ AWS への課金対象の呼び出しを行い、状態ファイルの隣へ非�
 
 検証中は probe 専用の rate entry を一時追加し、終了時に元の entry を復元します。予算検証では専用 probe の計上済み費用と上限を 10 USD に設定します。実際に推論で 10 USD を消費したり、employee の上限を変更したりはしません。Probe 利用者は検証後に無効化します。復旧ファイルが残っていれば検証は停止します。[復旧手順](runtime_v2/OPERATIONS_JA.md#再開と復旧) に従い、`python runtime_v2/manage.py restore-verification --yes` を使います。
 
-検証は過去のレポートを `verification-history/` に退避し、終了状態 (`PASSED` / `FAILED` / `INTERRUPTED`) と日時を記録します。最新の管理・検証機能の変更について、新しい AWS E2E 検証はまだ実施していません。[VERIFICATION.md](runtime_v2/VERIFICATION.md) の過去の結果から今回の成功を判断しないでください。[検証の詳細](runtime_v2/OPERATIONS_JA.md#検証と手動チェック) をご参照ください。
+検証は過去のレポートを `verification-history/` に退避し、終了状態 (`PASSED` / `FAILED` / `INTERRUPTED`) と日時を記録します。Strands への移行と最新の管理・検証機能の変更について、新しい AWS E2E 検証はまだ実施していません。[VERIFICATION.md](runtime_v2/VERIFICATION.md) の過去の結果から今回の成功を判断しないでください。[検証の詳細](runtime_v2/OPERATIONS_JA.md#検証と手動チェック) をご参照ください。
 
 ## 環境を保持して再利用する
 
@@ -163,15 +165,16 @@ python runtime_v2/manage.py invoke --user employee --model standard \
   --task "チーム会議の準備項目を 2 件記録し、短い議題案を返してください。"
 ```
 
-通常の呼び出しで `deploy` を繰り返す必要はありません。配置の再開やコード変更の反映が必要な場合は、保存済み設定を書き出し、同じ状態で配置します。
+通常の呼び出しで `deploy` を繰り返す必要はありません。既存の Runtime V2 環境へ Strands への移行を反映する場合は、Python の依存関係を更新し、保存済み設定を書き出してください。同じプロファイル・リージョン・状態で配置します。
 
 ```bash
+python -m pip install -r runtime_v2/requirements.txt &&
 python runtime_v2/manage.py export-config --output local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py deploy --config local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py status
 ```
 
-Export は保存済み設定だけを書き出し、既存の出力パスを拒否します。必要なら新しいファイル名を選んでください。既存環境には設定例の既定値ではなく、この設定を使ってください。状態、認証情報、出力した設定、実行結果は非公開で保管してください。復旧と client は [OPERATIONS_JA.md](runtime_v2/OPERATIONS_JA.md) をご参照ください。通常の再利用では cleanup を実行しないでください。
+既存の Runtime V2 上のエージェント配置物を更新し、Gateway、Cognito、Policy、rate limit、interceptor、DynamoDB テーブルを再利用します。配置の再開や以降のコード変更にも同じ手順を使ってください。Export は保存済み設定だけを書き出し、既存の出力パスを拒否します。必要なら新しいファイル名を選んでください。既存環境には設定例の既定値ではなく、この設定を使ってください。状態、認証情報、出力した設定、実行結果は非公開で保管してください。復旧と client は [OPERATIONS_JA.md](runtime_v2/OPERATIONS_JA.md) をご参照ください。通常の再利用では cleanup を実行しないでください。
 
 ## 任意の cleanup
 

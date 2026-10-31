@@ -1,6 +1,18 @@
 # Runtime V2 verification
 
-## Current documentation and recovery update (2026-10-30)
+## Strands migration (2026-10-30)
+
+- The coworker now uses Strands Agents `1.62.0`, a fresh `Agent` for each invocation, and two `@tool` functions. A custom Model adapter preserves the existing nonstreaming Messages / Responses requests through AgentCore Gateway.
+- All 49 offline Runtime V2 tests passed. These run the actual Strands loop against mocked Gateway responses. They cover both API histories, native reasoning/signatures, exact JWT forwarding and isolation, ordered tool execution, the 32-call ceiling, refusal/timeout handling without retries, and stopping subsequent work after unexpected tool errors.
+- The Linux ARM64 Python 3.11 ZIP was built with Strands included. Its `agent.py` was compared with the working source after deployment.
+- The retained Runtime V2 was updated from version `3` to version `4` and reported `READY`. This is a deployment status, not proof of successful model invocation.
+- The post-deployment read-only check confirmed Gateway `READY`, Policy `ENFORCE`, and rate limit `ACTIVE`, with both upstream interceptors attached. Resource identities, model configuration, Runtime authentication/header forwarding, and application limits were retained. No verification recovery file was pending.
+- Independent read-only review identified an unexpected-tool-exception continuation issue. It was fixed, regression tests were added, and the reviewer confirmed the change.
+- AWS model invocations and the E2E suite have not been rerun for this Strands artifact. The earlier AWS results below apply to the previous implementation and must not be used as validation of the migration.
+
+Use the [English operations guide](OPERATIONS.md) or [Japanese operations guide](OPERATIONS_JA.md) with the retained deployment state to run `python runtime_v2/verify.py`. Resources remain deployed.
+
+## Earlier documentation and recovery update (2026-10-30)
 
 - All 44 offline Runtime V2 tests passed, including interrupted-run reporting, rate recovery, configuration export, and failures during AWS initialization.
 - All 76 Python source files compiled successfully.

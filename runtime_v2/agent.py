@@ -1,4 +1,4 @@
-"""Small, stateless AI coworker for the AgentCore Runtime HTTP protocol.
+"""Small, stateless Strands AI coworker for the AgentCore Runtime HTTP protocol.
 
 Run with ``python runtime_v2/agent.py`` (port 8080). Runtime must validate JWTs
 and allowlist Authorization for forwarding to this container. Gateway must
@@ -13,6 +13,7 @@ are discarded afterwards. No network client is captured in a V2 snapshot.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import os
@@ -24,6 +25,11 @@ from urllib.parse import urlsplit
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from strands import Agent, tool
+from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.models.model import Model as StrandsModel
+from strands.tools.executors import SequentialToolExecutor
+from strands.types.exceptions import EventLoopException
 
 
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -316,7 +322,7 @@ def parse_turn(api, document):
     return output, "\n".join(text), calls, reason
 
 
-def execute_tool(name, arguments, work_items):
+def validate_tool_arguments(name, arguments):
     if name not in ("record_work_item", "list_work_items"):
         raise Stop("UNKNOWN_TOOL", 409, 200)
     if isinstance(arguments, str):
@@ -328,11 +334,18 @@ def execute_tool(name, arguments, work_items):
     if not isinstance(arguments, dict) or set(arguments) != expected:
         raise Stop("INVALID_TOOL_ARGUMENTS", 409, 200)
     if name == "list_work_items":
-        return {"work_items": list(work_items)}
+        return arguments
     for field, limit in (("title", 160), ("detail", 2000)):
         value = arguments[field]
         if not isinstance(value, str) or not value.strip() or len(value) > limit:
             raise Stop("INVALID_TOOL_ARGUMENTS", 409, 200)
+    return arguments
+
+
+def execute_tool(name, arguments, work_items):
+    arguments = validate_tool_arguments(name, arguments)
+    if name == "list_work_items":
+        return {"work_items": list(work_items)}
     if len(work_items) >= MAX_WORK_ITEMS:
         raise Stop("WORK_ITEM_LIMIT", 409, 200)
     item = {"id": len(work_items) + 1, **arguments}
@@ -340,13 +353,158 @@ def execute_tool(name, arguments, work_items):
     return {"recorded": item}
 
 
+class GatewayModel(StrandsModel):
+    """Adapt buffered Gateway JSON to Strands' internal model-event protocol.
+
+    A fresh instance is created per invocation. Native assistant items are kept
+    intact: Responses reasoning and Messages thinking signatures must survive a
+    tool round trip even though the coworker only displays text and tool results.
+    This class does not run tools or choose the next agent step; Strands does.
+    """
+
+    def __init__(self, settings, model, authorization, client):
+        self.settings, self.model = settings, model
+        self._authorization, self._client = authorization, client
+        self._native_turns = []
+        self._seen_call_ids = set()
+        self.calls, self.answer = 0, ""
+        self.tool_failure = None
+
+    def get_config(self):
+        # Credentials never enter model metadata or framework traces.
+        return {"model_id": self.model.model_id}
+
+    def update_config(self, **model_config):
+        raise ValueError("Model configuration is fixed for this invocation.")
+
+    async def structured_output(self, output_model, prompt, system_prompt=None, **kwargs):
+        raise NotImplementedError("This coworker returns text and work items.")
+        yield  # The Model interface requires an async generator.
+
+    def native_history(self, messages):
+        """Translate Strands user/tool messages and restore native assistant turns."""
+        if len(messages) != 2 * len(self._native_turns) + 1:
+            raise Stop("INVALID_AGENT_HISTORY")
+        history = []
+        for index, message in enumerate(messages):
+            if index % 2:
+                if message["role"] != "assistant":
+                    raise Stop("INVALID_AGENT_HISTORY")
+                output = deepcopy(self._native_turns[index // 2])
+                if self.model.api == "messages":
+                    history.append({"role": "assistant", "content": output})
+                else:
+                    history.extend(output)
+                continue
+            if message["role"] != "user":
+                raise Stop("INVALID_AGENT_HISTORY")
+            if index == 0:
+                history.append({
+                    "role": "user", "content": "".join(block["text"] for block in message["content"]),
+                })
+                continue
+            results = []
+            for block in message["content"]:
+                result = block["toolResult"]
+                if result.get("status") != "success":
+                    raise self.tool_failure or Stop("TOOL_EXECUTION_ERROR", 409, 200)
+                serialized = "".join(part["text"] for part in result["content"])
+                if self.model.api == "messages":
+                    results.append({
+                        "type": "tool_result", "tool_use_id": result["toolUseId"], "content": serialized,
+                    })
+                else:
+                    results.append({
+                        "type": "function_call_output", "call_id": result["toolUseId"], "output": serialized,
+                    })
+            if self.model.api == "messages":
+                history.append({"role": "user", "content": results})
+            else:
+                history.extend(results)
+        return history
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, **kwargs):
+        if self.tool_failure:
+            raise self.tool_failure
+        if self.calls >= self.settings.max_model_calls:
+            raise Stop("MAX_MODEL_CALLS", 409, 200)
+        history = self.native_history(messages)
+        self.calls += 1  # Includes refusals and ambiguous transport failures.
+        document = call_gateway(
+            self._client, self.settings, self.model, self._authorization,
+            request_body(self.settings, self.model, history),
+        )
+        output, text, calls, reason = parse_turn(self.model.api, document)
+        if text:
+            self.answer = text
+        if reason:
+            raise Stop(reason, 409, 200)
+        validated_calls = []
+        for call_id, name, arguments in calls:
+            if (not isinstance(call_id, str) or not call_id or len(call_id) > 512
+                    or call_id in self._seen_call_ids):
+                raise Stop("INVALID_TOOL_CALL", 409, 200)
+            self._seen_call_ids.add(call_id)
+            # Validate before Strands parses/coerces arguments or executes a tool.
+            validated_calls.append((call_id, name, validate_tool_arguments(name, arguments)))
+        self._native_turns.append(deepcopy(output))
+
+        # These events are produced only after the whole JSON response arrives.
+        # They drive Strands' loop, not progressive streaming to the Runtime user.
+        yield {"messageStart": {"role": "assistant"}}
+        index = 0
+        if text:
+            yield {"contentBlockStart": {"contentBlockIndex": index, "start": {}}}
+            yield {"contentBlockDelta": {"contentBlockIndex": index, "delta": {"text": text}}}
+            yield {"contentBlockStop": {"contentBlockIndex": index}}
+            index += 1
+        for call_id, name, arguments in validated_calls:
+            yield {"contentBlockStart": {
+                "contentBlockIndex": index, "start": {"toolUse": {"toolUseId": call_id, "name": name}},
+            }}
+            yield {"contentBlockDelta": {
+                "contentBlockIndex": index,
+                "delta": {"toolUse": {"input": json.dumps(arguments, ensure_ascii=False)}},
+            }}
+            yield {"contentBlockStop": {"contentBlockIndex": index}}
+            index += 1
+        yield {"messageStop": {"stopReason": "tool_use" if calls else "end_turn"}}
+
+
+def coworker_tools(model, work_items):
+    """Bind two Strands tools to invocation-local notes."""
+    def invoke(name, arguments):
+        if model.tool_failure:
+            return {"status": "error", "content": [{"text": model.tool_failure.reason}]}
+        try:
+            return execute_tool(name, arguments, work_items)
+        except Stop as stopped:
+            # Strands converts tool exceptions to model-visible tool results.
+            # Preserve the stop so no subsequent tool/model call can resume work.
+            model.tool_failure = stopped
+            return {"status": "error", "content": [{"text": stopped.reason}]}
+        except Exception:
+            # Unexpected tool failures must also stop the remaining tools.
+            # Neither the model nor the caller receives raw exception details.
+            model.tool_failure = Stop("TOOL_EXECUTION_ERROR", 409, 200)
+            return {"status": "error", "content": [{"text": model.tool_failure.reason}]}
+
+    @tool(description=TOOL_DEFINITIONS[0]["description"], inputSchema=TOOL_DEFINITIONS[0]["parameters"])
+    def record_work_item(title: str, detail: str) -> dict:
+        return invoke("record_work_item", {"title": title, "detail": detail})
+
+    @tool(description=TOOL_DEFINITIONS[1]["description"], inputSchema=TOOL_DEFINITIONS[1]["parameters"])
+    def list_work_items() -> dict:
+        return invoke("list_work_items", {})
+
+    return [record_work_item, list_work_items]
+
+
 def run_agent(payload, authorization, settings, client):
-    """Bounded model/tool loop. Never switch models, retry, or persist user state."""
+    """Run a fresh Strands Agent without retries, model switching or shared state."""
     alias = payload["model"]
-    model = settings.catalog[alias]
-    history = [{"role": "user", "content": payload["task"]}]
-    work_items, answer, model_calls = [], "", 0
-    seen_call_ids = set()
+    model = GatewayModel(settings, settings.catalog[alias], authorization, client)
+    work_items = []
 
     def result(status, reason=None, gateway_status=None):
         # Runtime replaces non-2xx container responses with an opaque service
@@ -359,52 +517,33 @@ def run_agent(payload, authorization, settings, client):
             "http_status": status,
             "gateway_status": gateway_status,
             "model": alias,
-            "model_calls": model_calls,
-            "answer": answer,
+            "model_calls": model.calls,
+            "answer": model.answer,
             "work_items": work_items,
         })
 
     try:
-        for _ in range(settings.max_model_calls):
-            model_calls += 1  # Attempts, including a refusal or ambiguous transport failure.
-            document = call_gateway(
-                client, settings, model, authorization, request_body(settings, model, history),
-            )
-            output, text, calls, reason = parse_turn(model.api, document)
-            if text:
-                answer = text
-            if reason:
-                raise Stop(reason, 409, 200)
-            if not calls:
-                return result(200, gateway_status=200)
-            # Preserve every native item, including reasoning/signatures and tool IDs.
-            if model.api == "messages":
-                history.append({"role": "assistant", "content": output})
-            else:
-                history.extend(output)
-            tool_results = []
-            for call_id, name, arguments in calls:
-                if (not isinstance(call_id, str) or not call_id or len(call_id) > 512
-                        or call_id in seen_call_ids):
-                    raise Stop("INVALID_TOOL_CALL", 409, 200)
-                seen_call_ids.add(call_id)
-                tool_output = execute_tool(name, arguments, work_items)
-                serialized = json.dumps(tool_output, ensure_ascii=False)
-                if model.api == "messages":
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": call_id, "content": serialized,
-                    })
-                else:
-                    tool_results.append({
-                        "type": "function_call_output", "call_id": call_id, "output": serialized,
-                    })
-            if model.api == "messages":
-                history.append({"role": "user", "content": tool_results})
-            else:
-                history.extend(tool_results)
-        raise Stop("MAX_MODEL_CALLS", 409, 200)
+        coworker = Agent(
+            model=model, system_prompt=SYSTEM_PROMPT, tools=coworker_tools(model, work_items),
+            callback_handler=None, retry_strategy=None, context_manager=False,
+            # All bounded turns fit; no truncation/compression or auxiliary model.
+            conversation_manager=SlidingWindowConversationManager(
+                window_size=2 * settings.max_model_calls + 1, should_truncate_results=False,
+            ),
+            tool_executor=SequentialToolExecutor(),
+        )
+        coworker(payload["task"])
+        if model.tool_failure:
+            raise model.tool_failure
+        return result(200, gateway_status=200)
     except Stop as stopped:
         return result(stopped.http_status, stopped.reason, stopped.gateway_status)
+    except EventLoopException as failure:
+        stopped = failure.original_exception
+        if isinstance(stopped, Stop):
+            return result(stopped.http_status, stopped.reason, stopped.gateway_status)
+        # Unexpected framework/adapter errors also stop without another request.
+        return result(502, "AGENT_EXECUTION_ERROR")
 
 
 def create_app(

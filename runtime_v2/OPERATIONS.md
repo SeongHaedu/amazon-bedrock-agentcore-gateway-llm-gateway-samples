@@ -65,9 +65,11 @@ The hosted agent accepts exactly two JSON fields:
 }
 ```
 
-It calls `record_work_item(title, detail)` and `list_work_items()` as in-memory note tools. History and work items are discarded at the end of each invocation. Messages uses `tool_use` / `tool_result`; Responses uses `function_call` / `function_call_output`. Native output items are preserved when continuing the conversation.
+A Strands `Agent` manages the model/tool loop. `record_work_item(title, detail)` and `list_work_items()` are registered with `@tool` as in-memory note tools; they do not execute the work described in a note. History and work items are discarded at the end of each invocation.
 
-The model requests use `stream: false`. Runtime returns one JSON result after the bounded loop finishes. Both `manage.py invoke` and `client.py` print an outer `http_status` and `result`:
+A small custom Strands `Model` adapter connects the agent to the existing Gateway Messages / Responses APIs. Messages uses `tool_use` / `tool_result`; Responses uses `function_call` / `function_call_output`. The adapter preserves native output items when continuing the conversation.
+
+Gateway model requests use `stream: false`. Strands' internal events support its loop; they do not provide progressive streaming to the caller. Runtime returns one JSON result in the existing format after the bounded Strands loop finishes. Both `manage.py invoke` and `client.py` print an outer `http_status` and `result`:
 
 | Field | Meaning |
 |---|---|
@@ -96,7 +98,7 @@ Other model/tool validation stops are defined in [agent.py](agent.py). Neither c
 
 ![Inbound authentication, model authorization, and interceptor responsibilities](../images/en/01b-auth-controls.png)
 
-Both Runtime and Gateway accept the configured Cognito clients and require `llm-gateway-access`. Runtime's header allowlist exposes `Authorization` to the container; the agent explicitly copies it into each Gateway request. Gateway authorizes the user's JWT and signs the Bedrock request with its own execution role.
+Both Runtime and Gateway accept the configured Cognito clients and require `llm-gateway-access`. Runtime's header allowlist exposes `Authorization` to the container; the custom Model adapter forwards the value received for that invocation on every Gateway model request. Gateway authorizes the user's JWT and signs the Bedrock request with its own execution role.
 
 Policy matches the JWT `sub`, Gateway resource, API action, and exact `context.input.model`. Employee permissions name only the added `bedrock-models` target. `restricted` has only the standard permit, while `outsider` fails the group requirement.
 
@@ -107,7 +109,7 @@ Policy matches the JWT `sub`, Gateway resource, API action, and exact `context.i
 
 The original `bedrock-mantle` target remains deployed. The coworker's Policy selects the added provider. Deployment resolves the selected inference profiles with `GetInferenceProfile`, checks `ACTIVE`, and grants the Gateway role access to the profiles, underlying foundation models, and `project/default`. Existing interceptor permissions remain.
 
-Runtime's execution policy covers artifacts, logs, and workload identity. The agent has no DynamoDB/IAM tools or direct Bedrock invocation permissions. Task text cannot change the server's model catalog, endpoint, tools, or limits.
+Runtime's execution policy covers artifacts, logs, and workload identity. Its role has no direct Bedrock or budget-table access, and the agent has no DynamoDB/IAM tools. Task text cannot change the server's model catalog, endpoint, tools, or limits. The Strands migration leaves model authorization and rate limits with Gateway, and budget checks and accounting with the existing REQUEST / RESPONSE Lambda functions and DynamoDB.
 
 ## Budgets and accounting
 
@@ -155,7 +157,7 @@ The script waits for propagation and REQUEST's cache. Its `finally` block uses t
 
 Before each run, the CLI archives the previous `verification.json` under `verification-history/`. During checks the status is `RUNNING`. Completion records `PASSED` or `FAILED`; a caught keyboard interruption records `INTERRUPTED`. Terminal reports include `started_at` and `completed_at` in UTC. Failure/interruption reports also include `error` and `recovery_pending`. A hard termination may leave `RUNNING`.
 
-Require both `status="PASSED"` and `passed: true` in the new report, and inspect its checks, evidence, and timestamps. The latest management and verification changes have not yet had a new AWS E2E run. Historical results in [VERIFICATION.md](VERIFICATION.md) do not validate these changes. Keep current and archived reports private.
+Require both `status="PASSED"` and `passed: true` in the new report, and inspect its checks, evidence, and timestamps. The Strands migration and the latest management and verification changes have not yet had a new AWS E2E run. Historical results in [VERIFICATION.md](VERIFICATION.md) do not validate these changes. Keep current and archived reports private.
 
 For a small manual comparison:
 
@@ -179,9 +181,12 @@ python -m unittest discover -s tests -p 'test_runtime_v2*.py' -v
 
 ## Resume and recovery
 
-Keep state after any partial failure. To resume deployment or deploy code changes, export the configuration saved with that state. This preserves the deployment's models, prices, and limits even if `config.example.json` has changed. If the agent artifact changed, `deploy` updates Runtime and waits for V2 readiness.
+Keep state after any partial failure. To apply the Strands migration, resume deployment, or deploy later code changes, select the original profile, Region, and state as described [above](#keep-and-select-an-existing-environment). Update Python dependencies and export the configuration saved with that state. This preserves the deployment's models, prices, and limits even if `config.example.json` has changed.
+
+Use the existing Runtime V2 deployment and its Gateway, Cognito, Policy, rate limits, REQUEST / RESPONSE Lambda functions, and DynamoDB table. Do not create a new state path for this code migration. If the agent artifact changed, `deploy` updates the existing Runtime and waits for V2 readiness; no direct Bedrock or budget-table permissions need to be added to its role.
 
 ```bash
+python -m pip install -r runtime_v2/requirements.txt &&
 python runtime_v2/manage.py export-config --output local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py deploy --config local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py status
