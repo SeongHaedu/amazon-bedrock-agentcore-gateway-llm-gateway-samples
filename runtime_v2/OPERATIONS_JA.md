@@ -39,7 +39,7 @@ Runtime / Gateway の `READY`、platform の `V2`、Policy の `ENFORCE`、両 i
 
 ## 利用者向け client
 
-[client.py](client.py) は Cognito にサインインし、ホスト済み Runtime を呼び出します。利用者には Python と HTTPX が必要ですが、AWS SDK の認証情報や管理者プロファイルは不要です。管理者は出力済み `client.json`、本人のユーザー名、本人のパスワードだけを安全な経路で渡す。
+[client.py](client.py) は Cognito にサインインし、ホスト済み Runtime を呼び出します。利用者には Python と HTTPX が必要ですが、AWS SDK の認証情報や管理者プロファイルは不要です。管理者は出力済み `client.json`、本人のユーザー名、本人のパスワードだけを安全な経路で渡します。
 
 受け取った設定を利用者側リポジトリの `local/client.json` に保存し、次を実行します。
 
@@ -65,9 +65,11 @@ CLI は `USER_PASSWORD_AUTH` を有効にした専用の Cognito app client を�
 }
 ```
 
-`record_work_item(title, detail)` と `list_work_items()` はメモリ内のメモ操作です。会話履歴と作業項目は各 invocation の終了時に破棄します。Messages は `tool_use` / `tool_result`、Responses は `function_call` / `function_call_output` を使い、会話の継続時には API 固有の出力項目を保持します。
+Strands の `Agent` がモデル・ツールループを管理します。`record_work_item(title, detail)` と `list_work_items()` は、`@tool` で登録したメモリ内のメモ操作です。メモに書いた作業自体は実行しません。会話履歴と作業項目は各 invocation の終了時に破棄します。
 
-モデル要求は `stream: false` を使います。Runtime は上限付きループ終了後に JSON 結果を 1 つ返します。`manage.py invoke` と `client.py` は、外側の `http_status` と `result` を出力します。
+小さなカスタム Strands `Model` アダプターで、エージェントを既存の Gateway の Messages / Responses API へ接続します。Messages は `tool_use` / `tool_result`、Responses は `function_call` / `function_call_output` を使います。アダプターは会話の継続時に API 固有の出力項目を保持します。
+
+Gateway へのモデル要求は `stream: false` を使います。Strands の内部イベントはループ処理に使い、利用者への逐次ストリーミングは行いません。Runtime は上限付きの Strands ループ終了後に、既存形式の JSON 結果を 1 つ返します。`manage.py invoke` と `client.py` は、外側の `http_status` と `result` を出力します。
 
 | フィールド | 意味 |
 |---|---|
@@ -96,7 +98,7 @@ CLI は `USER_PASSWORD_AUTH` を有効にした専用の Cognito app client を�
 
 ![Inbound 認証、モデル認可、interceptor の役割](../images/ja/01b-auth-controls.png)
 
-Runtime と Gateway は設定した Cognito client の JWT を受け入れ、`llm-gateway-access` への所属を要求します。Runtime の header allowlist で `Authorization` をコンテナへ渡し、エージェントが各 Gateway 要求へ明示的にコピーします。Gateway は利用者の JWT で認可し、自身の実行ロールで Bedrock 要求を署名します。
+Runtime と Gateway は設定した Cognito client の JWT を受け入れ、`llm-gateway-access` への所属を要求します。Runtime の header allowlist で `Authorization` をコンテナへ渡し、カスタム Model アダプターがその invocation で受信した値を各 Gateway モデル要求へ転送します。Gateway は利用者の JWT で認可し、自身の実行ロールで Bedrock 要求を署名します。
 
 Policy は JWT の `sub`、Gateway リソース、API action、正確な `context.input.model` を照合します。Employee の権限は追加した `bedrock-models` target だけを指定します。`restricted` は standard の permit だけを持ち、`outsider` はグループ要件を満たしません。
 
@@ -107,7 +109,7 @@ Policy は JWT の `sub`、Gateway リソース、API action、正確な `contex
 
 元の `bedrock-mantle` target は配置したまま保持します。AI 社員の Policy は追加した provider を対象とします。配置時に `GetInferenceProfile` で選択した profile を取得して `ACTIVE` を確認し、Gateway ロールに profile、参照先 foundation model、`project/default` への権限を追加します。既存の interceptor 権限も保持します。
 
-Runtime の実行ポリシーは配置物、ログ、workload identity を扱います。エージェントには DynamoDB / IAM のツールや Bedrock の直接呼び出し権限を持たせません。タスク本文からサーバーのモデル一覧、endpoint、ツール、上限は変更できません。
+Runtime の実行ポリシーは配置物、ログ、workload identity を扱います。Runtime ロールには Bedrock や予算テーブルへの直接アクセスを許可せず、エージェントにも DynamoDB / IAM のツールを持たせません。タスク本文からサーバーのモデル一覧、endpoint、ツール、上限は変更できません。Strands への移行後も、モデル認可と rate limit は Gateway、予算検査と費用計上は既存の REQUEST / RESPONSE Lambda と DynamoDB が担当します。
 
 ## 予算と費用計上
 
@@ -155,7 +157,7 @@ Rate probe は所有する rate limit に主体を限定した entry を追加�
 
 CLI は開始前に前回の `verification.json` を `verification-history/` へ退避します。チェック実行中は `RUNNING`、終了時は `PASSED` または `FAILED` を記録し、捕捉できたキーボード割り込みは `INTERRUPTED` として記録します。終了レポートは UTC の `started_at` と `completed_at` を含みます。失敗・中断時は `error` と `recovery_pending` も記録します。強制終了では `RUNNING` のまま残る場合があります。
 
-新しいレポートで `status="PASSED"` と `passed: true` の両方を確認し、各チェック、実行記録、日時を読みます。最新の管理・検証機能の変更について、新しい AWS E2E 検証はまだ実施していません。[VERIFICATION.md](VERIFICATION.md) の過去の結果から変更後の成功を判断しないでください。現在と過去のレポートは非公開で保管してください。
+新しいレポートで `status="PASSED"` と `passed: true` の両方を確認し、各チェック、実行記録、日時を読みます。Strands への移行と最新の管理・検証機能の変更について、新しい AWS E2E 検証はまだ実施していません。[VERIFICATION.md](VERIFICATION.md) の過去の結果から変更後の成功を判断しないでください。現在と過去のレポートは非公開で保管してください。
 
 小規模な手動比較では、呼び出しの前後で費用を確認します。
 
@@ -179,9 +181,12 @@ python -m unittest discover -s tests -p 'test_runtime_v2*.py' -v
 
 ## 再開と復旧
 
-途中で失敗した場合も状態を保持します。配置の再開やコード変更の反映では、その状態に保存した設定を出力します。`config.example.json` が変わっていても、構築時のモデル、単価、上限を維持できます。エージェントの配置物が変わっていれば、`deploy` は Runtime を更新して V2 の準備完了を待ちます。
+途中で失敗した場合も状態を保持します。Strands への移行、配置の再開、以降のコード変更では、[既存環境の選択手順](#既存環境を保持して選択する) に従い、元のプロファイル・リージョン・状態を指定してください。Python の依存関係を更新し、その状態に保存した設定を出力します。`config.example.json` が変わっていても、構築時のモデル、単価、上限を維持できます。
+
+既存の Runtime V2 と、その Gateway、Cognito、Policy、rate limit、REQUEST / RESPONSE Lambda、DynamoDB テーブルを再利用します。今回のコード移行で新しい状態パスを作成しないでください。エージェントの配置物が変わっていれば、`deploy` は既存の Runtime を更新して V2 の準備完了を待ちます。Runtime ロールに Bedrock や予算テーブルへの直接アクセス権限を追加する必要はありません。
 
 ```bash
+python -m pip install -r runtime_v2/requirements.txt &&
 python runtime_v2/manage.py export-config --output local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py deploy --config local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py status

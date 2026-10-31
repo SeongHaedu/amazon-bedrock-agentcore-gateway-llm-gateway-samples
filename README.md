@@ -5,7 +5,7 @@ English | [Japanese](README_JA.md)
 > [!NOTE]
 > This repository is not provided by AWS. It is a sample based on verification in one personal environment. My opinions are my own.
 
-Run a small AI coworker on Amazon Bedrock AgentCore Runtime V2 and manage its model calls through AgentCore Gateway. Cognito authenticates the user, AgentCore Policy authorizes models, rate limits control traffic, and REQUEST / RESPONSE interceptors check budgets and record model costs.
+Run a small AI coworker built with Strands Agents on Amazon Bedrock AgentCore Runtime V2 and manage its model calls through AgentCore Gateway. Cognito authenticates the user, AgentCore Policy authorizes models, rate limits control traffic, and REQUEST / RESPONSE interceptors check budgets and record model costs.
 
 This personal implementation extends an [AWS usage-interceptor sample](https://github.com/aws-samples/sample-agentcore-gateway-usage-interceptor) while keeping its template and Lambda code unchanged. Use only `runtime_v2/` for this walkthrough; root modules and `scripts/` are legacy prototypes with separate setup and state.
 
@@ -15,7 +15,9 @@ Blog post (Japanese): https://zenn.dev/aws_japan/articles/agentcore-llm-gateway
 
 ![AgentCore Gateway architecture with Runtime V2, authentication, authorization, traffic controls, and usage accounting](images/en/01a-aws-architecture.png)
 
-The request path is `User → Runtime V2 → Gateway → Amazon Bedrock`. The agent records in-memory work items and returns a written deliverable. Its tools do not execute the work described in those notes.
+The request path is `User → Runtime V2 → Gateway → Amazon Bedrock`. A Strands `Agent` runs the model/tool loop with `record_work_item` and `list_work_items` registered through `@tool`. These tools record and inspect in-memory notes; they do not execute the work described in them. The agent returns a written deliverable.
+
+A small custom Strands `Model` adapter sends model calls to Gateway using the existing Messages / Responses APIs with `stream: false`. Model authorization, rate limits, and budget accounting remain with Gateway and the existing REQUEST / RESPONSE Lambda functions and DynamoDB.
 
 | Control | Implementation |
 |---|---|
@@ -115,7 +117,7 @@ python runtime_v2/manage.py invoke --user employee --model premium \
   --task "Plan a one-day onboarding session. Record two work items with record_work_item, inspect them with list_work_items, and return a short plan. Do not claim to have performed the work."
 ```
 
-The helper signs in using the private demonstration-user credentials. Runtime returns one synchronous JSON result after the model/tool loop finishes (`stream: false`). Inspect `result.status`, `answer`, `work_items`, and `model_calls`; model output is nondeterministic.
+The helper signs in using the private demonstration-user credentials. Runtime returns the existing synchronous JSON result after the Strands model/tool loop finishes. Strands' internal events do not provide progressive streaming to the caller; Gateway model requests still use `stream: false`. Inspect `result.status`, `answer`, `work_items`, and `model_calls`; model output is nondeterministic.
 
 | User | `standard` | `premium` |
 |---|---|---|
@@ -144,7 +146,7 @@ This runs billable AWS checks and writes private `verification.json` beside the 
 
 Verification temporarily adds probe-specific rate entries, then restores the original entries. It sets a dedicated probe's recorded spending and caps to USD 10; it does not spend USD 10 to test the budget or alter the employee's caps. Probe users are disabled afterward. If a recovery file remains, verification stops; use `python runtime_v2/manage.py restore-verification --yes` as described in [recovery](runtime_v2/OPERATIONS.md#resume-and-recovery).
 
-The verifier archives prior reports under `verification-history/` and records terminal status (`PASSED`, `FAILED`, or `INTERRUPTED`) with timestamps. A new AWS E2E run has not been performed for the latest management and verification changes. Earlier results in [VERIFICATION.md](runtime_v2/VERIFICATION.md) do not certify them. See [verification details](runtime_v2/OPERATIONS.md#verification-and-manual-checks).
+The verifier archives prior reports under `verification-history/` and records terminal status (`PASSED`, `FAILED`, or `INTERRUPTED`) with timestamps. A new AWS E2E run has not been performed for the Strands migration or the latest management and verification changes. Earlier results in [VERIFICATION.md](runtime_v2/VERIFICATION.md) do not certify them. See [verification details](runtime_v2/OPERATIONS.md#verification-and-manual-checks).
 
 ## Keep and reuse the environment
 
@@ -163,15 +165,16 @@ python runtime_v2/manage.py invoke --user employee --model standard \
   --task "Record two preparation tasks for a team meeting and give a short agenda."
 ```
 
-Routine invocations do not require another `deploy`. When resuming deployment or deploying code changes, export the saved configuration and use the same state:
+Routine invocations do not require another `deploy`. To apply the Strands migration to an existing Runtime V2 deployment, update Python dependencies, export the saved configuration, and deploy with the same profile, Region, and state:
 
 ```bash
+python -m pip install -r runtime_v2/requirements.txt &&
 python runtime_v2/manage.py export-config --output local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py deploy --config local/runtime-v2-saved-config.json &&
 python runtime_v2/manage.py status
 ```
 
-Export writes only saved configuration and refuses an existing output path; choose a new filename if necessary. Use this configuration for an existing deployment rather than the example defaults. Keep state, credentials, exported configuration, and results private. See [OPERATIONS.md](runtime_v2/OPERATIONS.md) for recovery and client access. Do not run cleanup during normal reuse.
+This updates the agent artifact on the existing Runtime V2 and reuses its Gateway, Cognito, Policy, rate limits, interceptors, and DynamoDB table. Use the same procedure to resume deployment or apply later code changes. Export writes only saved configuration and refuses an existing output path; choose a new filename if necessary. Use this configuration for an existing deployment rather than the example defaults. Keep state, credentials, exported configuration, and results private. See [OPERATIONS.md](runtime_v2/OPERATIONS.md) for recovery and client access. Do not run cleanup during normal reuse.
 
 ## Optional cleanup
 
